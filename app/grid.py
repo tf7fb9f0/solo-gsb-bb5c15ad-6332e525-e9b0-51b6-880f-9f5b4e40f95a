@@ -1285,3 +1285,182 @@ def compute_time_preview(voices: list[dict], segments: list[dict]) -> dict:
             timed_voices.append({"name": voice["name"], "events": events})
 
         return {"total_seconds": boundary_seconds[-1], "voices": timed_voices}
+
+
+# --- Rehearsal chunks: splitting a measure into bounded preview chunks ------
+
+class RehearsalChunksInfeasible(Exception):
+    """No boundary cut keeps every chunk at or below the duration cap."""
+
+    def __init__(self, max_duration: Fraction, start: Fraction, end: Fraction) -> None:
+        super().__init__(
+            f"no rehearsal chunk cut: the boundary gap "
+            f"{format_rational(end - start)} exceeds the maximum chunk "
+            f"duration {format_rational(max_duration)}"
+        )
+        self.max_duration = max_duration
+        self.start = start
+        self.end = end
+
+
+def rehearsal_chunks_preview(voices: list[dict], max_duration: Fraction) -> dict:
+    """Split a measure into rehearsal chunks bounded by ``max_duration``.
+
+    Cuts are allowed only at the union of every event's start/end
+    boundaries (the same points that define ``compute_grid``), so each
+    chunk is a union of consecutive half-open grid intervals and every
+    chunk has positive length. Every chunk length must be at most
+    ``max_duration``; when two adjacent union boundaries already lie more
+    than that apart (an event interval no cut may enter spans more than
+    the cap), no partition exists and RehearsalChunksInfeasible is raised.
+
+    Among all feasible partitions the result is chosen by:
+
+    1. the minimum number of chunks (cuts);
+    2. the minimum total number of times a sound event still sounds
+       across a cut — a cut truncates exactly the sound events with
+       start < cut < end (half-open: an event starting at the cut or
+       ending there is not truncated; rests never count);
+    3. the cut sequence that is lexicographically earliest in time
+       (compare the first differing cut, the smaller one wins).
+
+    ``voices`` items are {"name": str, "events": [built events]}. Returns
+    {"max_duration": Fraction, "chunks": [{"start", "end"}],
+    "cuts": [{"at", "truncated": [events], "truncated_count": int}],
+    "truncated_event_total": int} with Fraction bounds.
+
+    Optimization: a DP over union-boundary positions i. tail[i] is the
+    pair (minimum number of cuts still needed from i to the end, minimum
+    truncation total among those minimum-cut partitions). Cutting at j
+    adds one cut and cut_cost[j], the number of events truncated there;
+    the pair is ordered (fewer edges first, then smaller cost). The
+    precheck of adjacent gaps certifies a completion exists for every
+    position. Forward reconstruction then always takes the earliest
+    boundary completing an optimum, which yields the lexicographically
+    earliest optimal cut sequence.
+    """
+    points: set[Fraction] = set()
+    for voice in voices:
+        for event in voice["events"]:
+            points.add(event["start"])
+            points.add(event["end"])
+    boundaries = sorted(points)
+    last = len(boundaries) - 1
+
+    # A cut is forbidden inside every event, so a gap between adjacent
+    # union boundaries longer than the cap is an uncuttable interval.
+    for left, right in zip(boundaries, boundaries[1:]):
+        if right - left > max_duration:
+            raise RehearsalChunksInfeasible(max_duration, left, right)
+
+    # cut_cost[k] = number of sound events strictly spanning boundary k
+    # (start < boundaries[k] < end). Built with a difference array: each
+    # spanning event adds one to every strictly interior boundary.
+    cut_cost = [0] * len(boundaries)
+    sounds = [
+        event
+        for voice in voices
+        for event in voice["events"]
+        if event["kind"] == KIND_SOUND
+    ]
+    index_of_point = {point: index for index, point in enumerate(boundaries)}
+    for event in sounds:
+        span_start = index_of_point[event["start"]]
+        span_end = index_of_point[event["end"]]
+        if span_end - span_start >= 2:
+            cut_cost[span_start + 1] += 1
+            cut_cost[span_end] -= 1
+    running = 0
+    for index, delta in enumerate(cut_cost):
+        running += delta
+        cut_cost[index] = running
+
+    # Backward DP: (minimum cuts to the end, minimum truncation total
+    # among those). None marks a position from which the end is
+    # unreachable within the cap; the final position needs no cut.
+    tail_edges: list[int | None] = [None] * len(boundaries)
+    tail_cost: list[int | None] = [None] * len(boundaries)
+    tail_edges[last] = 0
+    tail_cost[last] = 0
+    for index in range(last - 1, -1, -1):
+        best_edges: int | None = None
+        best_cost: int | None = None
+        upper_limit = boundaries[index] + max_duration
+        for next_index in range(index + 1, len(boundaries)):
+            if boundaries[next_index] > upper_limit:
+                break
+            if tail_edges[next_index] is None:
+                continue
+            edges = 1 + tail_edges[next_index]  # type: ignore[operator]
+            cost = cut_cost[next_index] + tail_cost[next_index]
+            if best_edges is None or edges < best_edges or (
+                edges == best_edges and cost < best_cost
+            ):
+                best_edges = edges
+                best_cost = cost
+        tail_edges[index] = best_edges
+        tail_cost[index] = best_cost
+
+    assert tail_edges[0] is not None  # the gap precheck guarantees a cut
+
+    # Forward reconstruction: always move to the earliest boundary that
+    # (a) reaches the end within the cap and (b) still completes a global
+    # optimum. Picking the smallest such point makes the very next cut as
+    # early as possible, which is exactly the time-lexicographic order.
+    chosen: list[int] = []
+    position = 0
+    spent_edges = 0
+    spent_cost = 0
+    while position != last:
+        upper_limit = boundaries[position] + max_duration
+        for next_index in range(position + 1, len(boundaries)):
+            if boundaries[next_index] > upper_limit:
+                break
+            if tail_edges[next_index] is None:
+                continue
+            edges = spent_edges + 1 + tail_edges[next_index]
+            cost = (
+                spent_cost + cut_cost[next_index] + tail_cost[next_index]
+            )
+            if edges == tail_edges[0] and cost == tail_cost[0]:
+                break
+        else:  # pragma: no cover - DP guarantees an optimal completion
+            raise AssertionError("no optimal rehearsal chunk continuation")
+        spent_edges += 1
+        spent_cost += cut_cost[next_index]
+        position = next_index
+        # The measure end closes the last chunk but is not an internal cut.
+        if position != last:
+            chosen.append(next_index)
+
+    # The chosen cut positions tile the measure into consecutive chunks.
+    chunk_bounds = [0, *chosen, last]
+    chunks = [
+        {"start": boundaries[left], "end": boundaries[right]}
+        for left, right in zip(chunk_bounds, chunk_bounds[1:])
+    ]
+
+    cuts = []
+    for cut_index in chosen:
+        at = boundaries[cut_index]
+        truncated = [
+            event
+            for voice in voices  # stored voice order fixes the listing
+            for event in voice["events"]
+            if event["kind"] == KIND_SOUND
+            and event["start"] < at < event["end"]
+        ]
+        cuts.append(
+            {
+                "at": at,
+                "truncated": truncated,
+                "truncated_count": len(truncated),
+            }
+        )
+
+    return {
+        "max_duration": max_duration,
+        "chunks": chunks,
+        "cuts": cuts,
+        "truncated_event_total": sum(cut_cost[index] for index in chosen),
+    }

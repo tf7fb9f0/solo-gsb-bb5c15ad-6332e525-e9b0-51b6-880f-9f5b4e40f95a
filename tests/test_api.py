@@ -1137,3 +1137,169 @@ def test_practice_tracks_is_read_only():
     response = client.post(f"/measures/{measure_id}/practice-tracks")
     assert response.status_code == 200
     assert client.get(f"/measures/{measure_id}").json() == before
+
+
+# --- POST /measures/{id}/rehearsal-chunks-preview ---------------------------
+
+def test_rehearsal_chunks_preview_minimum_chunks_and_truncated_events():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "1/2"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+    assert body["max_duration"] == "1/2"
+    assert body["chunk_count"] == 2
+    assert body["chunks"] == [
+        {"start": "0", "end": "1/2"},
+        {"start": "1/2", "end": "1"},
+    ]
+    # Only bass's v2e2 ([1/4, 1)) still sounds across the 1/2 cut.
+    assert body["cuts"] == [
+        {"at": "1/2", "truncated": ["v2e2"], "truncated_count": 1}
+    ]
+    assert body["truncated_event_count"] == 1
+
+
+def test_rehearsal_chunks_preview_whole_measure_is_one_chunk():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "1"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["chunk_count"] == 1
+    assert body["chunks"] == [{"start": "0", "end": "1"}]
+    assert body["cuts"] == []
+    assert body["truncated_event_count"] == 0
+
+
+def test_rehearsal_chunks_preview_ties_break_lexicographically_earliest():
+    # Rest-only measure on quarter boundaries, cap 3/8: all cuts truncate
+    # zero events, so the earliest feasible cut sequence wins.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "rest", "duration": "1/4"},
+                {"kind": "rest", "duration": "1/4"},
+                {"kind": "rest", "duration": "1/4"},
+                {"kind": "rest", "duration": "1/4"},
+            ]},
+            {"name": "b", "events": [
+                {"kind": "rest", "duration": "1/2"},
+                {"kind": "rest", "duration": "1/2"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "3/8"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["chunk_count"] == 4
+    assert [cut["at"] for cut in body["cuts"]] == ["1/4", "1/2", "3/4"]
+    assert all(cut["truncated"] == [] for cut in body["cuts"])
+    assert body["truncated_event_count"] == 0
+
+
+def test_rehearsal_chunks_preview_secondary_objective_prefers_fewer_events():
+    # Union 0, 1/3, 1/2, 2/3, 1; cap 2/3: a single cut suffices. The cut
+    # at 1/3 truncates two sounds while 1/2 truncates one, so 1/2 wins.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [{"kind": "sound", "duration": "1"}]},
+            {"name": "b", "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "rest", "duration": "1/6"},
+                {"kind": "sound", "duration": "1/3"},
+            ]},
+            {"name": "c", "events": [
+                {"kind": "rest", "duration": "1/3"},
+                {"kind": "rest", "duration": "1/6"},
+                {"kind": "rest", "duration": "1/6"},
+                {"kind": "rest", "duration": "1/3"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "2/3"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["chunk_count"] == 2
+    assert body["cuts"] == [
+        {"at": "1/2", "truncated": ["v1e1"], "truncated_count": 1}
+    ]
+    assert body["truncated_event_count"] == 1
+
+
+def test_rehearsal_chunks_preview_infeasible_returns_422_and_does_not_save():
+    # One single event spans the whole measure: the only union boundaries
+    # are 0 and 1, so no cut can keep a chunk below 1/2.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [{"kind": "sound", "duration": "1"}]},
+            {"name": "b", "events": [{"kind": "rest", "duration": "1"}]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    before = client.get(f"/measures/{measure_id}").json()
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "1/2"},
+    )
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["max_duration"] == "1/2"
+    assert detail["gap_start"] == "0"
+    assert detail["gap_end"] == "1"
+    assert detail["gap"] == "1"
+    assert "saved" in detail["message"]
+    # Read-only: nothing changed.
+    assert client.get(f"/measures/{measure_id}").json() == before
+
+
+def test_rehearsal_chunks_preview_404_for_missing_measure():
+    response = client.post(
+        "/measures/999999/rehearsal-chunks-preview",
+        json={"max_duration": "1/2"},
+    )
+    assert response.status_code == 404
+    assert response.json() == {"detail": "measure not found"}
+
+
+def test_rehearsal_chunks_preview_validates_payload():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # max_duration must be a positive rational string.
+    for bad in ("0", "-1/2", "abc", "1.5", "1/0"):
+        response = client.post(
+            f"/measures/{measure_id}/rehearsal-chunks-preview",
+            json={"max_duration": bad},
+        )
+        assert response.status_code == 422, bad
+    # Missing body / field.
+    assert client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview", json={}
+    ).status_code == 422
+
+
+def test_rehearsal_chunks_preview_is_read_only():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    before = client.get(f"/measures/{measure_id}").json()
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "3/8"},
+    )
+    assert response.status_code == 200
+    assert client.get(f"/measures/{measure_id}").json() == before

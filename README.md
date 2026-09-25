@@ -572,6 +572,107 @@ curl -s -X POST http://localhost:8000/measures/1/practice-tracks
 }
 ```
 
+### `POST /measures/{id}/rehearsal-chunks-preview` — 排练分段预览（只读，不写库）
+
+把已保存小节切成若干个**排练片段（chunk）**，用于按片段排练：
+
+- **只能在该小节所有事件起止边界的并集处下刀**（与 `GET /measures/{id}/grid` 是同一组
+  边界点），因此每个片段都是若干相邻半开网格段的并，长度严格为正，且片段首尾无缝拼成
+  整小节；
+- 每个片段长度都**不得超过**请求给出的正有理数 `max_duration`（半开区间
+  `[start, end)`，长度 = end − start）；
+- 在所有可行切法中依次按以下优先级择优：
+  1. **片段数最少**（即切点最少）；
+  2. **跨切点仍在发声的事件总次数最少**：一个发声事件的半开区间严格跨过某切点
+     （`start < 切点 < end`）即在该切点被截断一次；恰好在切点开始或结束的事件、以及
+     休止事件都不计入；
+  3. 前两项都相同时，取**切点序列按时间字典序最早**者（第一个不同的切点取时间更小的）。
+
+全部运算使用 `fractions.Fraction` 精确完成。
+
+- 请求体：`max_duration` 为**正有理数字符串**（格式同时长，拒绝 `0`、负数、小数、
+  分母为 0）；格式错误或缺字段返回 **422**（请求校验错误）。
+- 小节 ID 不存在返回 **404**。
+- **无可行切法**（某两个相邻边界之间的间隔本身就超过 `max_duration`，而下刀点又不能
+  落在任何事件内部）时返回 **422**，detail 给出 `max_duration` 以及第一个超标的
+  `gap_start` / `gap_end` / `gap`；该接口为**只读预览，不写入数据库**。
+
+```bash
+curl -s -X POST http://localhost:8000/measures/1/rehearsal-chunks-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"max_duration": "1/2"}'
+```
+
+例：小节时长 `1`，`melody` 在 `[0, 1/2)`、`[3/4, 1)` 发声，`bass` 在 `[1/4, 1)`
+发声。并集边界为 `0`、`1/4`、`1/2`、`3/4`、`1`。`max_duration = 1/2` 时两段即可：
+切点只能取 `1/2`，严格跨过它的只有 bass 的 `v2e2`（melody 的第一个音恰好在切点结束，
+不计）：
+
+```json
+{
+  "measure_id": 1,
+  "target_duration": "1",
+  "max_duration": "1/2",
+  "chunk_count": 2,
+  "truncated_event_count": 1,
+  "chunks": [
+    {"start": "0",   "end": "1/2"},
+    {"start": "1/2", "end": "1"}
+  ],
+  "cuts": [
+    {"at": "1/2", "truncated": ["v2e2"], "truncated_count": 1}
+  ]
+}
+```
+
+把上限收紧到 `3/8` 时，必须在 `1/4`、`1/2`、`3/4` 三处全部下刀（四段均不超过
+`3/8`）；三次截断合计 `3` 次（`v1e1` 在 `1/4` 被截断，`v2e2` 在 `1/2`、`3/4` 各被
+截断一次）：
+
+```json
+{
+  "measure_id": 1,
+  "target_duration": "1",
+  "max_duration": "3/8",
+  "chunk_count": 4,
+  "truncated_event_count": 3,
+  "chunks": [
+    {"start": "0",   "end": "1/4"},
+    {"start": "1/4", "end": "1/2"},
+    {"start": "1/2", "end": "3/4"},
+    {"start": "3/4", "end": "1"}
+  ],
+  "cuts": [
+    {"at": "1/4", "truncated": ["v1e1"], "truncated_count": 1},
+    {"at": "1/2", "truncated": ["v2e2"], "truncated_count": 1},
+    {"at": "3/4", "truncated": ["v2e2"], "truncated_count": 1}
+  ]
+}
+```
+
+各字段含义：
+
+| 字段                       | 说明                                                                 |
+| -------------------------- | -------------------------------------------------------------------- |
+| `chunks`                   | 半开片段 `[start, end)` 列表；前一段 `end` 即后一段 `start`，首段从 `0` 起、末段到小节目标时长止，每段长度 ≤ `max_duration` |
+| `chunk_count`              | 片段数（最小化目标，= 切点数 + 1）                                   |
+| `cuts`                     | 内部切点（不含末尾的小节终点）：`at` 为切点时刻，`truncated` 为严格跨过该切点、仍在发声的事件 ID（按声部存储顺序排列），`truncated_count` 为其数量 |
+| `truncated_event_count`    | 所有切点截断次数之和（第二优化目标，最小值）                         |
+
+无可行切法时返回 **422**（下例中整个小节只有一个事件，内部无边界可切）：
+
+```json
+{
+  "detail": {
+    "message": "no rehearsal chunk cut keeps every chunk within max_duration; cuts are allowed only at the measure's event boundaries; nothing was saved",
+    "max_duration": "1/2",
+    "gap_start": "0",
+    "gap_end": "1",
+    "gap": "1"
+  }
+}
+```
+
 > 在浏览器中打开 http://localhost:8000/ 可查看服务与接口清单，
 > http://localhost:8000/docs 为可直接发起请求的 Swagger UI。
 
@@ -588,7 +689,7 @@ python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（�
 
 ```
 app/
-  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖）、速度段积分换算秒数、领奏接力最省换手预览、排练双轨分组（冲突图二染色 + 负载均衡，纯标准库）
+  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖）、速度段积分换算秒数、领奏接力最省换手预览、排练双轨分组（冲突图二染色 + 负载均衡）、排练分段（边界切点上的最少段数/最少截断动态规划，纯标准库）
   db.py        # SQLite 连接、建表、读写（纯标准库）
   schemas.py   # Pydantic 请求/响应模型与校验
   main.py      # FastAPI 应用与路由（启动时初始化数据库）

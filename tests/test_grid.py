@@ -10,6 +10,7 @@ from app.grid import (
     LoopAlignmentTooLarge,
     PracticeTracksInfeasible,
     QuantizationInfeasible,
+    RehearsalChunksInfeasible,
     TempoSegmentsInvalid,
     align_loops,
     avoidance_muting,
@@ -28,6 +29,7 @@ from app.grid import (
     practice_track_split,
     quantize_measure,
     rational_lcm,
+    rehearsal_chunks_preview,
     voice_total,
 )
 
@@ -1309,6 +1311,193 @@ class ComputeTimePreviewTest(unittest.TestCase):
         self.assertEqual(format_seconds(bass[1]["start_seconds"]), "0.500000")
         self.assertEqual(format_seconds(bass[1]["end_seconds"]), "2.386294")
         self.assertEqual(format_seconds(result["total_seconds"]), "2.386294")
+
+
+class RehearsalChunksPreviewTest(unittest.TestCase):
+    # VALID_PAYLOAD-shaped measure: union boundaries
+    # 0, 1/4, 1/2, 3/4, 1. melody sounds [0,1/2) and [3/4,1); bass
+    # sounds [1/4,1). Cut costs: 1/4 -> 1 (melody), 1/2 -> 1 (bass),
+    # 3/4 -> 1 (bass).
+    def _quarter_measure(self):
+        return make_voices(
+            [
+                (
+                    "melody",
+                    [(KIND_SOUND, "1/2"), (KIND_REST, "1/4"), (KIND_SOUND, "1/4")],
+                ),
+                ("bass", [(KIND_REST, "1/4"), (KIND_SOUND, "3/4")]),
+            ]
+        )
+
+    def test_cap_fitting_the_whole_measure_gives_one_uncut_chunk(self):
+        result = rehearsal_chunks_preview(self._quarter_measure(), Fraction(1))
+        self.assertEqual(
+            [(c["start"], c["end"]) for c in result["chunks"]],
+            [(Fraction(0), Fraction(1))],
+        )
+        self.assertEqual(result["cuts"], [])
+        self.assertEqual(result["truncated_event_total"], 0)
+
+    def test_minimum_chunks_and_truncated_events_with_cut_listing(self):
+        # Cap 1/2: two chunks are enough, and the only length-1/2 cut is
+        # at 1/2, which truncates bass's v2e2 (it runs [1/4,1)).
+        result = rehearsal_chunks_preview(self._quarter_measure(), Fraction(1, 2))
+        self.assertEqual(
+            [(c["start"], c["end"]) for c in result["chunks"]],
+            [(Fraction(0), Fraction(1, 2)), (Fraction(1, 2), Fraction(1))],
+        )
+        self.assertEqual(len(result["cuts"]), 1)
+        cut = result["cuts"][0]
+        self.assertEqual(cut["at"], Fraction(1, 2))
+        self.assertEqual([event["id"] for event in cut["truncated"]], ["v2e2"])
+        self.assertEqual(cut["truncated_count"], 1)
+        self.assertEqual(result["truncated_event_total"], 1)
+
+    def test_chunks_tile_the_measure_and_never_exceed_the_cap(self):
+        # Cap 3/8 forces a cut at every quarter offset; the same result
+        # must hold for the exact quarter cap.
+        for cap in (Fraction(3, 8), Fraction(1, 4)):
+            result = rehearsal_chunks_preview(self._quarter_measure(), cap)
+            chunks = result["chunks"]
+            self.assertEqual(chunks[0]["start"], Fraction(0))
+            self.assertEqual(chunks[-1]["end"], Fraction(1))
+            for left, right in zip(chunks, chunks[1:]):
+                self.assertEqual(left["end"], right["start"])
+                self.assertLessEqual(left["end"] - left["start"], cap)
+            self.assertEqual(
+                [c["at"] for c in result["cuts"]],
+                [Fraction(1, 4), Fraction(1, 2), Fraction(3, 4)],
+            )
+            # 1/4 truncates v1e1, 1/2 and 3/4 truncate the long bass event.
+            self.assertEqual(
+                [[e["id"] for e in cut["truncated"]] for cut in result["cuts"]],
+                [["v1e1"], ["v2e2"], ["v2e2"]],
+            )
+            self.assertEqual(result["truncated_event_total"], 3)
+
+    def test_events_starting_or_ending_at_a_cut_are_not_truncated(self):
+        # The cut at 1/2 ends melody's first sound and bass's rest while
+        # bass's sound is strictly inside it: only the latter truncates.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [(KIND_REST, "1/4"), (KIND_SOUND, "1/2"), (KIND_REST, "1/4")]),
+            ]
+        )
+        result = rehearsal_chunks_preview(voices, Fraction(1, 2))
+        (cut,) = result["cuts"]
+        self.assertEqual(cut["at"], Fraction(1, 2))
+        self.assertEqual([event["id"] for event in cut["truncated"]], ["v2e2"])
+        self.assertEqual(cut["truncated_count"], 1)
+
+    def test_secondary_objective_prefers_fewer_truncated_events(self):
+        # Union boundaries 0, 1/3, 1/2, 2/3, 1. A long sound spans the
+        # whole measure and a second voice sounds [0,1/2); cut costs are
+        # 1/3 -> 2, 1/2 -> 1, 2/3 -> 1. With cap 2/3 a single cut is
+        # enough at any of them; the lex-earliest (1/3) costs two but
+        # 1/2 costs one, so the secondary objective chooses 1/2.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1")]),
+                ("b", [(KIND_SOUND, "1/2"), (KIND_REST, "1/6"), (KIND_SOUND, "1/3")]),
+                # Rest-only voice supplying the 1/3 and 2/3 boundaries.
+                (
+                    "c",
+                    [
+                        (KIND_REST, "1/3"),
+                        (KIND_REST, "1/6"),
+                        (KIND_REST, "1/6"),
+                        (KIND_REST, "1/3"),
+                    ],
+                ),
+            ]
+        )
+        result = rehearsal_chunks_preview(voices, Fraction(2, 3))
+        self.assertEqual(len(result["chunks"]), 2)
+        self.assertEqual([cut["at"] for cut in result["cuts"]], [Fraction(1, 2)])
+        self.assertEqual(
+            [event["id"] for event in result["cuts"][0]["truncated"]], ["v1e1"]
+        )
+        self.assertEqual(result["truncated_event_total"], 1)
+
+    def test_tertiary_objective_picks_earliest_cut_on_a_tie(self):
+        # No sound spans any cut (rest-only measure), so every partition
+        # truncates zero events: the tie is broken time-lexicographically.
+        # Cap 3/8 on quarter boundaries: first cut 1/4, then from 1/4 the
+        # farthest reachable boundary is 1/2, etc. — 1/4, 1/2, 3/4.
+        voices = make_voices(
+            [
+                (
+                    "a",
+                    [
+                        (KIND_REST, "1/4"),
+                        (KIND_REST, "1/4"),
+                        (KIND_REST, "1/4"),
+                        (KIND_REST, "1/4"),
+                    ],
+                ),
+                ("b", [(KIND_REST, "1/2"), (KIND_REST, "1/2")]),
+            ]
+        )
+        result = rehearsal_chunks_preview(voices, Fraction(3, 8))
+        self.assertEqual(
+            [cut["at"] for cut in result["cuts"]],
+            [Fraction(1, 4), Fraction(1, 2), Fraction(3, 4)],
+        )
+        self.assertEqual(
+            [cut["truncated"] for cut in result["cuts"]], [[], [], []]
+        )
+        self.assertEqual(result["truncated_event_total"], 0)
+
+    def test_lexicographic_tie_break_on_a_later_cut(self):
+        # Union boundaries 0, 1/6, 7/12, 2/3, 1 with cap 1/2; no sounds
+        # at all, so every partition truncates zero events. The first cut
+        # is forced to 1/6 (7/12 is more than 1/2 away from 0). From
+        # there both 7/12 and 2/3 finish the measure in one further cut,
+        # so the later tied decision takes the earlier boundary 7/12.
+        voices = make_voices(
+            [
+                (
+                    "a",
+                    [
+                        (KIND_REST, "1/6"),
+                        (KIND_REST, "5/12"),
+                        (KIND_REST, "1/12"),
+                        (KIND_REST, "1/3"),
+                    ],
+                )
+            ]
+        )
+        result = rehearsal_chunks_preview(voices, Fraction(1, 2))
+        self.assertEqual(
+            [cut["at"] for cut in result["cuts"]],
+            [Fraction(1, 6), Fraction(7, 12)],
+        )
+        self.assertEqual(len(result["chunks"]), 3)
+
+    def test_infeasible_when_a_boundary_gap_exceeds_the_cap(self):
+        # A single sound spans [0,1); the only union boundaries are 0 and
+        # 1, so no legal cut can bring a chunk below the measure length.
+        voices = make_voices(
+            [("a", [(KIND_SOUND, "1")]), ("b", [(KIND_REST, "1")])]
+        )
+        with self.assertRaises(RehearsalChunksInfeasible) as ctx:
+            rehearsal_chunks_preview(voices, Fraction(1, 2))
+        self.assertEqual(ctx.exception.start, Fraction(0))
+        self.assertEqual(ctx.exception.end, Fraction(1))
+        self.assertEqual(ctx.exception.max_duration, Fraction(1, 2))
+
+    def test_infeasible_on_an_internal_uncuttable_gap(self):
+        # One voice holds a single event [0,1); the other only adds a
+        # boundary at 1/2. Gaps are 1/2 and 1/2, so cap 1/3 leaves both
+        # uncuttable (the first offending gap 0 -> 1/2 is reported).
+        voices = make_voices(
+            [("a", [(KIND_SOUND, "1")]), ("b", [(KIND_REST, "1/2"), (KIND_REST, "1/2")])]
+        )
+        with self.assertRaises(RehearsalChunksInfeasible) as ctx:
+            rehearsal_chunks_preview(voices, Fraction(1, 3))
+        self.assertEqual(ctx.exception.start, Fraction(0))
+        self.assertEqual(ctx.exception.end, Fraction(1, 2))
 
 
 if __name__ == "__main__":

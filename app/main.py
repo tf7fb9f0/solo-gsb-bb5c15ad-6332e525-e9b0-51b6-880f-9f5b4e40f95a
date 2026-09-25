@@ -62,6 +62,16 @@ minimizes the absolute difference of the two tracks' total sounding
 durations, ties broken by the lexicographically smallest A/B label
 sequence in stored voice order. It is a read-only preview; nothing is
 written back to SQLite.
+
+A saved measure can finally be split into rehearsal chunks
+(POST /measures/{id}/rehearsal-chunks-preview): cuts are allowed only
+at the union of all event boundaries, every chunk must stay within a
+positive rational max_duration, and the partition is chosen by the
+fewest chunks, then the fewest sound events still sounding across a
+cut, then the time-lexicographically earliest cut sequence. When no
+such partition exists (a boundary gap already exceeds the cap) the
+request is rejected with 422. It is a read-only preview; nothing is
+written back to SQLite.
 """
 
 from __future__ import annotations
@@ -78,6 +88,7 @@ from .grid import (
     LoopAlignmentTooLarge,
     PracticeTracksInfeasible,
     QuantizationInfeasible,
+    RehearsalChunksInfeasible,
     TempoSegmentsInvalid,
     align_loops,
     avoidance_muting,
@@ -93,6 +104,7 @@ from .grid import (
     parse_rational,
     practice_track_split,
     quantize_measure,
+    rehearsal_chunks_preview,
     voice_total,
 )
 from .schemas import (
@@ -108,6 +120,8 @@ from .schemas import (
     PracticeTracksOut,
     QuantizationPreviewIn,
     QuantizationPreviewOut,
+    RehearsalChunksPreviewIn,
+    RehearsalChunksPreviewOut,
     RhythmMatchesOut,
     TimePreviewIn,
     TimePreviewOut,
@@ -145,6 +159,7 @@ def root() -> dict:
             "time_preview": "POST /measures/{id}/time-preview",
             "lead_handoff_preview": "POST /measures/{id}/lead-handoff-preview",
             "practice_tracks": "POST /measures/{id}/practice-tracks",
+            "rehearsal_chunks_preview": "POST /measures/{id}/rehearsal-chunks-preview",
         },
     }
 
@@ -620,4 +635,59 @@ def practice_tracks(measure_id: int) -> dict:
             "load": format_rational(result["load_b"]),
         },
         "load_difference": format_rational(result["load_difference"]),
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/rehearsal-chunks-preview",
+    response_model=RehearsalChunksPreviewOut,
+)
+def rehearsal_chunks_preview_route(
+    measure_id: int, payload: RehearsalChunksPreviewIn
+) -> dict:
+    # Read-only: the cut is computed from the stored measure in exact
+    # fractions, but SQLite is never written to.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    _, voices = _fraction_voices(measure)
+    max_duration = parse_rational(payload.max_duration)
+    try:
+        result = rehearsal_chunks_preview(voices, max_duration)
+    except RehearsalChunksInfeasible as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "no rehearsal chunk cut keeps every chunk "
+                "within max_duration; cuts are allowed only at the "
+                "measure's event boundaries; nothing was saved",
+                "max_duration": format_rational(max_duration),
+                "gap_start": format_rational(exc.start),
+                "gap_end": format_rational(exc.end),
+                "gap": format_rational(exc.end - exc.start),
+            },
+        ) from exc
+
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "max_duration": format_rational(result["max_duration"]),
+        "chunk_count": len(result["chunks"]),
+        "truncated_event_count": result["truncated_event_total"],
+        "chunks": [
+            {
+                "start": format_rational(chunk["start"]),
+                "end": format_rational(chunk["end"]),
+            }
+            for chunk in result["chunks"]
+        ],
+        "cuts": [
+            {
+                "at": format_rational(cut["at"]),
+                "truncated": [event["id"] for event in cut["truncated"]],
+                "truncated_count": cut["truncated_count"],
+            }
+            for cut in result["cuts"]
+        ],
     }
