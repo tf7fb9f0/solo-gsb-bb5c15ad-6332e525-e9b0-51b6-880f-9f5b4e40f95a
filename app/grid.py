@@ -1285,3 +1285,173 @@ def compute_time_preview(voices: list[dict], segments: list[dict]) -> dict:
             timed_voices.append({"name": voice["name"], "events": events})
 
         return {"total_seconds": boundary_seconds[-1], "voices": timed_voices}
+
+
+# --- Rehearsal chunks: cutting a measure into bounded-length pieces ---------
+
+class RehearsalChunksInfeasible(Exception):
+    """No boundary-anchored cut can keep every chunk within the bound."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        gap_start: Fraction,
+        gap_end: Fraction,
+        gap: Fraction,
+        max_duration: Fraction,
+    ) -> None:
+        super().__init__(f"rehearsal chunks infeasible: {reason}")
+        self.reason = reason
+        self.gap_start = gap_start
+        self.gap_end = gap_end
+        self.gap = gap
+        self.max_duration = max_duration
+
+
+def rehearsal_chunks_preview(voices: list[dict], max_duration: Fraction) -> dict:
+    """Cut a measure into rehearsal chunks bounded by ``max_duration``.
+
+    Cuts may only be placed at interior points of the half-open grid, i.e.
+    at the union of every voice's event start/end boundaries (the same
+    points used by ``compute_grid``); the measure start 0 and its end are
+    always chunk edges but never cuts. Each chunk spans one or more whole
+    grid cells and must have length at most ``max_duration``.
+
+    A cut at boundary p **truncates** a sound event e when e keeps
+    sounding across the cut, i.e. e.start < p < e.end (p strictly inside
+    the half-open event); events merely touching the cut (an event
+    ending there or starting there) are not truncated, and rests never
+    count.
+
+    Among all feasible cut sequences the result is chosen by, in order:
+
+    1. the minimum number of chunks;
+    2. among those, the minimum total number of truncated sounding
+       events across all cuts;
+    3. among those, the lexicographically earliest cut sequence by time
+       (each cut considered in order; the earlier cut wins).
+
+    Raises RehearsalChunksInfeasible when two adjacent union boundaries
+    are more than ``max_duration`` apart, since no legal cut can then
+    split the grid cell between them.
+
+    ``voices`` items are {"name": str, "events": [built events]}. Returns
+    {"length", "max_duration", "chunks": [{"start", "end"}],
+    "cuts": [{"point", "sounding_events"}], "chunk_count",
+    "cut_event_count"} with Fraction bounds; ``sounding_events`` lists
+    the truncated event ids in stored voice order.
+
+    Optimization: a DAG whose vertices are the ordered union boundaries.
+    Edge i -> j (i < j) exists exactly when b_j - b_i <= max_duration;
+    an edge charges one chunk and the truncation count of boundary j
+    (zero at the measure end). suffix[i] holds the lexicographically
+    smallest (chunks, truncations) pair reachable from i to the end.
+    Reconstruction walks forward and always takes the earliest next
+    boundary whose edge still reaches the suffix optimum, which yields
+    the lexicographically earliest optimal cut sequence.
+    """
+    points_set: set[Fraction] = set()
+    for voice in voices:
+        for event in voice["events"]:
+            points_set.add(event["start"])
+            points_set.add(event["end"])
+    boundaries = sorted(points_set)
+    assert boundaries[0] == Fraction(0)
+    count = len(boundaries)
+    length = boundaries[-1]
+
+    # Sounding events truncated at each boundary (strictly straddled);
+    # events ending or starting exactly at the boundary are not cut.
+    spanning: list[list[str]] = [[] for _ in boundaries]
+    for voice in voices:
+        ends = [event["end"] for event in voice["events"]]
+        for index, point in enumerate(boundaries):
+            slot = bisect_right(ends, point)
+            if slot < len(voice["events"]):
+                event = voice["events"][slot]
+                if (
+                    event["kind"] == KIND_SOUND
+                    and event["start"] < point < event["end"]
+                ):
+                    spanning[index].append(event["id"])
+    cut_cost = [len(ids) for ids in spanning]
+
+    # Feasibility precheck: a grid cell longer than the bound can never
+    # be split, since cuts are only allowed on its endpoints.
+    for index in range(count - 1):
+        gap = boundaries[index + 1] - boundaries[index]
+        if gap > max_duration:
+            raise RehearsalChunksInfeasible(
+                f"adjacent event boundaries {format_rational(boundaries[index])} "
+                f"and {format_rational(boundaries[index + 1])} are "
+                f"{format_rational(gap)} apart, more than the max chunk "
+                f"duration {format_rational(max_duration)}; no boundary-anchored "
+                "cut can split that span",
+                gap_start=boundaries[index],
+                gap_end=boundaries[index + 1],
+                gap=gap,
+                max_duration=max_duration,
+            )
+
+    # suffix[i] = (minimum number of chunks, minimum truncations) from
+    # boundary i to the measure end. The final boundary needs no edge.
+    suffix_chunks: list[int] = [0] * count
+    suffix_cuts: list[int] = [0] * count
+    for index in range(count - 2, -1, -1):
+        best_chunks: int | None = None
+        best_cuts: int | None = None
+        for following in range(index + 1, count):
+            if boundaries[following] - boundaries[index] > max_duration:
+                break
+            candidate_chunks = 1 + suffix_chunks[following]
+            candidate_cuts = cut_cost[following] + suffix_cuts[following]
+            if (
+                best_chunks is None
+                or (candidate_chunks, candidate_cuts) < (best_chunks, best_cuts)
+            ):
+                best_chunks = candidate_chunks
+                best_cuts = candidate_cuts
+        assert best_chunks is not None  # the precheck guarantees a neighbor edge
+        suffix_chunks[index] = best_chunks
+        suffix_cuts[index] = best_cuts
+
+    # Forward greedy reconstruction: at each boundary choose the earliest
+    # reachable next boundary whose edge can still complete a globally
+    # optimal pair. Earlier cuts win every tie, so the rebuilt sequence
+    # is the lexicographically earliest optimum.
+    chunk_count = suffix_chunks[0]
+    cut_event_count = suffix_cuts[0]
+    current = 0
+    starts: list[Fraction] = []
+    ends: list[Fraction] = []
+    cut_indices: list[int] = []
+    while current < count - 1:
+        chosen = next(
+            following
+            for following in range(current + 1, count)
+            if boundaries[following] - boundaries[current] <= max_duration
+            and 1 + suffix_chunks[following] == suffix_chunks[current]
+            and cut_cost[following] + suffix_cuts[following]
+            == suffix_cuts[current]
+        )
+        starts.append(boundaries[current])
+        ends.append(boundaries[chosen])
+        if chosen < count - 1:
+            cut_indices.append(chosen)
+        current = chosen
+
+    return {
+        "length": length,
+        "max_duration": max_duration,
+        "chunks": [
+            {"start": start, "end": end}
+            for start, end in zip(starts, ends)
+        ],
+        "cuts": [
+            {"point": boundaries[index], "sounding_events": spanning[index]}
+            for index in cut_indices
+        ],
+        "chunk_count": chunk_count,
+        "cut_event_count": cut_event_count,
+    }

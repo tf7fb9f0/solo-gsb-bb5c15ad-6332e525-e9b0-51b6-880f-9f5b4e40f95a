@@ -1137,3 +1137,225 @@ def test_practice_tracks_is_read_only():
     response = client.post(f"/measures/{measure_id}/practice-tracks")
     assert response.status_code == 200
     assert client.get(f"/measures/{measure_id}").json() == before
+
+
+# --- POST /measures/{id}/rehearsal-chunks-preview --------------------------
+
+def test_rehearsal_chunks_preview_min_chunks_and_truncated_events():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "1/2"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+    assert body["max_duration"] == "1/2"
+    assert body["chunk_count"] == 2
+    assert body["cut_event_count"] == 1
+    assert body["chunks"] == [
+        {"start": "0", "end": "1/2"},
+        {"start": "1/2", "end": "1"},
+    ]
+    # At 1/2 melody's first sound ends exactly there (not truncated);
+    # bass's v2e2 keeps sounding across the cut.
+    assert body["cuts"] == [{"point": "1/2", "sounding_events": ["v2e2"]}]
+    # Chunks tile [0, target) with no gaps or overlaps.
+    assert body["chunks"][0]["start"] == "0"
+    assert body["chunks"][-1]["end"] == body["target_duration"]
+    for left, right in zip(body["chunks"], body["chunks"][1:]):
+        assert left["end"] == right["start"]
+
+
+def test_rehearsal_chunks_preview_single_chunk_without_cuts():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    for bound in ("1", "2"):
+        response = client.post(
+            f"/measures/{measure_id}/rehearsal-chunks-preview",
+            json={"max_duration": bound},
+        )
+        assert response.status_code == 200, bound
+        body = response.json()
+        assert body["chunk_count"] == 1
+        assert body["cut_event_count"] == 0
+        assert body["chunks"] == [{"start": "0", "end": "1"}]
+        assert body["cuts"] == []
+
+
+def test_rehearsal_chunks_preview_second_objective_avoids_sound_events():
+    # a sounds the whole measure; b rests 1/4, sounds [1/4,3/4), rests;
+    # c rests 3/4 then sounds [3/4,1). With bound 1/2 the three-chunk
+    # cut {1/4, 3/4} truncates only a's event twice (2), while cuts
+    # involving 1/2 also truncate b's middle event (3).
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [{"kind": "sound", "duration": "1"}]},
+            {"name": "b", "events": [
+                {"kind": "rest", "duration": "1/4"},
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "rest", "duration": "1/4"},
+            ]},
+            {"name": "c", "events": [
+                {"kind": "rest", "duration": "3/4"},
+                {"kind": "sound", "duration": "1/4"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "1/2"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["chunk_count"] == 3
+    assert body["cut_event_count"] == 2
+    assert [cut["point"] for cut in body["cuts"]] == ["1/4", "3/4"]
+    assert all(cut["sounding_events"] == ["v1e1"] for cut in body["cuts"])
+    assert body["chunks"] == [
+        {"start": "0", "end": "1/4"},
+        {"start": "1/4", "end": "3/4"},
+        {"start": "3/4", "end": "1"},
+    ]
+
+
+def test_rehearsal_chunks_preview_third_objective_earliest_cuts():
+    # Four union boundaries at the quarters; no event straddles any of
+    # 1/4, 1/2, 3/4, so truncation ties everywhere. With bound 3/4 three
+    # two-chunk splits are possible; the lexicographically earliest cut
+    # is 1/4.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "sound", "duration": "1/4"},
+            ]},
+            {"name": "b", "events": [
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "rest", "duration": "1/2"},
+                {"kind": "sound", "duration": "1/4"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "3/4"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["chunk_count"] == 2
+    assert body["cut_event_count"] == 0
+    assert body["cuts"] == [{"point": "1/4", "sounding_events": []}]
+
+
+def test_rehearsal_chunks_preview_lists_truncated_events_in_voice_order():
+    # a and c sound across 1/3 and 2/3 (whole-measure events); b has its
+    # own boundaries there. The truncated id lists follow stored voice
+    # order: v1e1 before v3e1.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [{"kind": "sound", "duration": "1"}]},
+            {"name": "b", "events": [
+                {"kind": "sound", "duration": "1/3"},
+                {"kind": "rest", "duration": "1/3"},
+                {"kind": "sound", "duration": "1/3"},
+            ]},
+            {"name": "c", "events": [{"kind": "sound", "duration": "1"}]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "1/2"},
+    )
+    assert response.status_code == 200, response.text
+    cuts = response.json()["cuts"]
+    assert [cut["point"] for cut in cuts] == ["1/3", "2/3"]
+    assert cuts[0]["sounding_events"] == ["v1e1", "v3e1"]
+    assert cuts[1]["sounding_events"] == ["v1e1", "v3e1"]
+
+
+def test_rehearsal_chunks_preview_infeasible_returns_422_without_saving():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # The first grid cell [0, 1/4) cannot be split on a boundary and is
+    # longer than a 1/8 chunk.
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "1/8"},
+    )
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert "saved" in detail["message"]
+    assert detail["max_duration"] == "1/8"
+    assert detail["gap"] == {
+        "start": "0",
+        "end": "1/4",
+        "duration": "1/4",
+    }
+    assert "1/4" in detail["reason"]
+
+    # A whole-measure sound offers no interior cut at all.
+    whole = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "a", "events": [{"kind": "sound", "duration": "1"}]},
+            {"name": "b", "events": [{"kind": "rest", "duration": "1"}]},
+        ],
+    }
+    whole_id = client.post("/measures", json=whole).json()["id"]
+    response = client.post(
+        f"/measures/{whole_id}/rehearsal-chunks-preview",
+        json={"max_duration": "3/4"},
+    )
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["gap"] == {
+        "start": "0",
+        "end": "1",
+        "duration": "1",
+    }
+
+
+def test_rehearsal_chunks_preview_is_read_only():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    before = client.get(f"/measures/{measure_id}").json()
+    response = client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview",
+        json={"max_duration": "1/2"},
+    )
+    assert response.status_code == 200
+    assert client.get(f"/measures/{measure_id}").json() == before
+
+
+def test_rehearsal_chunks_preview_404_for_missing_measure():
+    response = client.post(
+        "/measures/999999/rehearsal-chunks-preview",
+        json={"max_duration": "1/2"},
+    )
+    assert response.status_code == 404
+    assert response.json() == {"detail": "measure not found"}
+
+
+def test_rehearsal_chunks_preview_validates_payload():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # max_duration must be a positive rational string.
+    for bad in ("0", "-1/2", "1.5", "abc", "1/0"):
+        response = client.post(
+            f"/measures/{measure_id}/rehearsal-chunks-preview",
+            json={"max_duration": bad},
+        )
+        assert response.status_code == 422, bad
+    # Missing body / field are request-validation errors too.
+    assert client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview", json={}
+    ).status_code == 422
+    assert client.post(
+        f"/measures/{measure_id}/rehearsal-chunks-preview"
+    ).status_code == 422

@@ -572,6 +572,122 @@ curl -s -X POST http://localhost:8000/measures/1/practice-tracks
 }
 ```
 
+### `POST /measures/{id}/rehearsal-chunks-preview` — 排练分段预览（只读，不写库）
+
+把已保存小节切成若干**排练片段**。切点只允许选在该小节**所有事件起止边界的并集**上
+（与 `GET /measures/{id}/grid` 完全相同的那些内部点）；`0` 与小节目标时长固定为首尾
+端点，不计入切点。每个片段为半开区间 `[start, end)`，**长度不得超过**请求给出的正有理数
+`max_duration`。
+
+切点 `p` **截断**的发声事件，指满足 `start < p < end`（切点严格落在事件内部）的
+`sound` 事件；恰好在切点结束或开始的事件**不算**被截断，休止事件也从不计入。同一切点
+截断多个声部的事件时，事件 ID 按声部的**存储顺序**列出。
+
+服务在所有可行切法中依次按下列标准择优：
+
+1. **片段数最少**；
+2. 片段数相同时，**跨切点仍在发声的事件总次数最少**（各切点截断的发声事件数之和；一个
+   事件被多个切点截断则按多次计）；
+3. 前两项仍相同时，**切点序列按时间的字典序最早**（逐个切点比较，越早的切点越优先）。
+
+全部运算使用 `fractions.Fraction` 精确完成；该接口为**只读预览，不写入数据库**，已保存
+小节保持不变。
+
+- 请求体：`max_duration` 为**正有理数字符串**（格式同时长，拒绝 `0`、负数、小数、分母为
+  0）；格式错误或缺少请求体返回 **422**（请求校验错误）。
+- 小节 ID 不存在返回 **404**。
+- 若**相邻两个并集边界之间的距离**本身就超过 `max_duration`，则该网格段无法再被合法切点
+  分割，**不存在可行切法**，返回 **422**，detail 给出 `max_duration` 与越界区间
+  `gap`（`start` / `end` / `duration`）及 `reason`。
+- 当 `max_duration` 不小于目标时长时，整小节就是一个片段，`cuts` 为空数组、
+  `cut_event_count` 为 `0`。
+
+```bash
+curl -s -X POST http://localhost:8000/measures/1/rehearsal-chunks-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"max_duration": "1/2"}'
+```
+
+例：小节时长 `1`，`melody` 在 `[0, 1/2)` 发声、`[1/2, 3/4)` 休止、`[3/4, 1)` 发声，
+`bass` 在 `[0, 1/4)` 休止、`[1/4, 1)` 发声。上限 `1/2` 时最少切成 2 段；切点 `1/2`
+处 melody 的首事件恰好在该点结束（不计），只有 bass 的 `v2e2` 仍在发声：
+
+```json
+{
+  "measure_id": 1,
+  "target_duration": "1",
+  "max_duration": "1/2",
+  "chunk_count": 2,
+  "cut_event_count": 1,
+  "chunks": [
+    {"start": "0",   "end": "1/2"},
+    {"start": "1/2", "end": "1"}
+  ],
+  "cuts": [
+    {"point": "1/2", "sounding_events": ["v2e2"]}
+  ]
+}
+```
+
+各字段含义：
+
+| 字段               | 说明                                                                 |
+| ------------------ | -------------------------------------------------------------------- |
+| `chunk_count`      | 片段数（第一择优目标，最小值）                                       |
+| `cut_event_count`  | 所有切点截断的发声事件次数之和（第二择优目标，最小值）               |
+| `chunks[]`         | 片段的半开有理起止 `start` / `end`，首尾无缝拼成 `[0, 目标时长)`     |
+| `cuts[]`           | 内部切点 `point` 及该点截断的发声事件 ID `sounding_events`（按声部存储顺序；没有事件被截断时为空数组） |
+
+第二择优标准的例子：`a` 整小节发声，`b` 在 `[1/4, 3/4)` 发声（两端休止），`c` 只在
+`[3/4, 1)` 发声。上限 `1/2` 时最少 3 段；切在 `1/4、3/4` 只截断 `a` 一个事件两次
+（共 2 次），而任何包含切点 `1/2` 的切法还会截断 `b` 的中间事件（共 3 次），故取
+`{1/4, 3/4}`：
+
+```json
+{
+  "measure_id": 2,
+  "target_duration": "1",
+  "max_duration": "1/2",
+  "chunk_count": 3,
+  "cut_event_count": 2,
+  "chunks": [
+    {"start": "0",   "end": "1/4"},
+    {"start": "1/4", "end": "3/4"},
+    {"start": "3/4", "end": "1"}
+  ],
+  "cuts": [
+    {"point": "1/4", "sounding_events": ["v1e1"]},
+    {"point": "3/4", "sounding_events": ["v1e1"]}
+  ]
+}
+```
+
+无可行切法时返回 **422**（本例并集相邻点 `0` 与 `1/4` 相距 `1/4`，超过上限 `1/8`，
+中间没有任何合法切点可用）：
+
+```bash
+curl -s -X POST http://localhost:8000/measures/1/rehearsal-chunks-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"max_duration": "1/8"}'
+```
+
+```json
+{
+  "detail": {
+    "message": "no boundary-anchored cut keeps every rehearsal chunk within max_duration; nothing was saved",
+    "reason": "adjacent event boundaries 0 and 1/4 are 1/4 apart, more than the max chunk duration 1/8; no boundary-anchored cut can split that span",
+    "max_duration": "1/8",
+    "gap": {"start": "0", "end": "1/4", "duration": "1/4"}
+  }
+}
+```
+
+小节不存在、请求体非法时：
+
+```json
+{"detail": "measure not found"}
+```
+
 > 在浏览器中打开 http://localhost:8000/ 可查看服务与接口清单，
 > http://localhost:8000/docs 为可直接发起请求的 Swagger UI。
 
@@ -588,7 +704,7 @@ python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（�
 
 ```
 app/
-  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖）、速度段积分换算秒数、领奏接力最省换手预览、排练双轨分组（冲突图二染色 + 负载均衡，纯标准库）
+  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部冲突静音（二分图最小权顶点覆盖）、速度段积分换算秒数、领奏接力最省换手预览、排练双轨分组（冲突图二染色 + 负载均衡）、排练分段（边界切点上的最少片段/最少截断/最早切序列，纯标准库）
   db.py        # SQLite 连接、建表、读写（纯标准库）
   schemas.py   # Pydantic 请求/响应模型与校验
   main.py      # FastAPI 应用与路由（启动时初始化数据库）

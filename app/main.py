@@ -62,6 +62,17 @@ minimizes the absolute difference of the two tracks' total sounding
 durations, ties broken by the lexicographically smallest A/B label
 sequence in stored voice order. It is a read-only preview; nothing is
 written back to SQLite.
+
+A saved measure can finally be cut into rehearsal chunks
+(POST /measures/{id}/rehearsal-chunks-preview): cuts are allowed only
+at the union of every event's start/end boundaries and every chunk
+must stay within a positive rational max_duration. The cut sequence
+minimizes first the number of chunks, then the total number of
+sounding events still active across cuts, then chooses the
+lexicographically earliest cut sequence by time. When two adjacent
+union boundaries are farther apart than max_duration no legal cut
+exists and the request is rejected with 422. It is a read-only
+preview; nothing is written back to SQLite.
 """
 
 from __future__ import annotations
@@ -78,6 +89,7 @@ from .grid import (
     LoopAlignmentTooLarge,
     PracticeTracksInfeasible,
     QuantizationInfeasible,
+    RehearsalChunksInfeasible,
     TempoSegmentsInvalid,
     align_loops,
     avoidance_muting,
@@ -93,6 +105,7 @@ from .grid import (
     parse_rational,
     practice_track_split,
     quantize_measure,
+    rehearsal_chunks_preview,
     voice_total,
 )
 from .schemas import (
@@ -108,6 +121,8 @@ from .schemas import (
     PracticeTracksOut,
     QuantizationPreviewIn,
     QuantizationPreviewOut,
+    RehearsalChunksPreviewIn,
+    RehearsalChunksPreviewOut,
     RhythmMatchesOut,
     TimePreviewIn,
     TimePreviewOut,
@@ -145,6 +160,9 @@ def root() -> dict:
             "time_preview": "POST /measures/{id}/time-preview",
             "lead_handoff_preview": "POST /measures/{id}/lead-handoff-preview",
             "practice_tracks": "POST /measures/{id}/practice-tracks",
+            "rehearsal_chunks_preview": (
+                "POST /measures/{id}/rehearsal-chunks-preview"
+            ),
         },
     }
 
@@ -620,4 +638,61 @@ def practice_tracks(measure_id: int) -> dict:
             "load": format_rational(result["load_b"]),
         },
         "load_difference": format_rational(result["load_difference"]),
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/rehearsal-chunks-preview",
+    response_model=RehearsalChunksPreviewOut,
+)
+def rehearsal_chunks_preview_route(
+    measure_id: int, payload: RehearsalChunksPreviewIn
+) -> dict:
+    # Read-only: the grid boundaries and the lexicographically optimal
+    # cut sequence are computed in exact fractions, but SQLite is never
+    # written back to.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    _, voices = _fraction_voices(measure)
+    max_duration = parse_rational(payload.max_duration)
+    try:
+        result = rehearsal_chunks_preview(voices, max_duration)
+    except RehearsalChunksInfeasible as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "no boundary-anchored cut keeps every rehearsal "
+                "chunk within max_duration; nothing was saved",
+                "reason": exc.reason,
+                "max_duration": format_rational(exc.max_duration),
+                "gap": {
+                    "start": format_rational(exc.gap_start),
+                    "end": format_rational(exc.gap_end),
+                    "duration": format_rational(exc.gap),
+                },
+            },
+        ) from exc
+
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "max_duration": format_rational(result["max_duration"]),
+        "chunk_count": result["chunk_count"],
+        "cut_event_count": result["cut_event_count"],
+        "chunks": [
+            {
+                "start": format_rational(chunk["start"]),
+                "end": format_rational(chunk["end"]),
+            }
+            for chunk in result["chunks"]
+        ],
+        "cuts": [
+            {
+                "point": format_rational(cut["point"]),
+                "sounding_events": cut["sounding_events"],
+            }
+            for cut in result["cuts"]
+        ],
     }

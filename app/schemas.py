@@ -350,3 +350,49 @@ class TimePreviewOut(BaseModel):
     # Seconds from the measure start to the final segment end.
     total_seconds: str
     voices: list[TimedVoiceOut]
+
+
+class RehearsalChunksPreviewIn(BaseModel):
+    """Maximum length of one rehearsal chunk (positive rational)."""
+
+    max_duration: str = Field(examples=["1/2"])
+
+    @field_validator("max_duration")
+    @classmethod
+    def max_duration_must_be_positive_rational(cls, value: str) -> str:
+        try:
+            parse_rational(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
+
+class RehearsalChunkOut(BaseModel):
+    """One half-open rehearsal chunk [start, end) tiled on grid cuts."""
+
+    start: str
+    end: str
+
+
+class RehearsalCutOut(BaseModel):
+    """One interior cut point and the sound events it truncates.
+
+    A sounding event is truncated when it keeps sounding across the cut
+    (its half-open interval strictly contains the point); an event
+    ending or starting exactly there is not listed.
+    """
+
+    point: str
+    sounding_events: list[str]
+
+
+class RehearsalChunksPreviewOut(BaseModel):
+    measure_id: int
+    target_duration: str
+    max_duration: str
+    # Minimum feasible number of chunks.
+    chunk_count: int
+    # Total truncated-sounding-event count over every cut (second objective).
+    cut_event_count: int
+    chunks: list[RehearsalChunkOut]
+    cuts: list[RehearsalCutOut]
